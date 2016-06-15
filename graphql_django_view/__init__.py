@@ -251,7 +251,7 @@ class BatchGraphQLView(GraphQLView):
                 # TODO: This is really optimistic.
                 # We may have status, we may have errors, etc...
                 # payload should be set according to graphql spec, not
-                # simply "IT WORKED™ Spec".
+                # simply "IT WORKED Spec".
                 results.append({
                     "id": _id,
                     "payload": {
