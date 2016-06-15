@@ -159,3 +159,141 @@ class GraphQLView(View):
         meta = request.META
         content_type = meta.get('CONTENT_TYPE', meta.get('HTTP_CONTENT_TYPE', ''))
         return content_type.split(';', 1)[0].lower()
+
+
+class BatchGraphQLView(GraphQLView):
+    '''
+    NOTE: THIS IS A WORK IN PROGRESS
+    DO NOT USE UNLESS YOU WANT TO ACCEPT THAT IT DOES NOT PROPERLY
+    HANDLE FAILURE AND ASSUMES EVERYTHING GOES SWIMMINGLY.
+    '''
+
+    def parse_body(self, request):
+        content_type = self.get_content_type(request)
+
+        if content_type == 'application/graphql':
+            return {'query': request.body.decode()}
+
+        elif content_type == 'application/json':
+            try:
+                request_json = json.loads(request.body.decode('utf-8'))
+                # NOTE: this is the only difference between batch and non.
+                assert isinstance(request_json, list)
+                return request_json
+            except:
+                raise HttpError(HttpResponseBadRequest('POST body sent invalid JSON.'))
+
+        elif content_type in ['application/x-www-form-urlencoded', 'multipart/form-data']:
+            return request.POST
+
+        return {}
+
+    @staticmethod
+    def get_graphql_params(data):
+        query = data.get('query')
+        variables = data.get('variables')
+        _id = data.get('id')
+
+        if variables and isinstance(variables, six.text_type):
+            try:
+                variables = json.loads(variables)
+            except:
+                raise HttpError(HttpResponseBadRequest('Variables are invalid JSON.'))
+
+        # NOTE: operation_name does not apply?
+        operation_name = None
+
+        return query, variables, operation_name, _id
+
+    def execute_graphql_request(self, request):
+        '''
+        THIS IS IMPLEMENTED IN A SUB-OPTIMAL MANNER. DO NOT...
+        A.) Judge Me.
+        B.) Use unless you accept that the performance here probably is miserable.
+        '''
+        subqueries = self.parse_body(request)
+        results = []
+        for subquery in subqueries:
+            query, variables, operation_name, _id = self.get_graphql_params(subquery)
+
+            if not query:
+                raise HttpError(HttpResponseBadRequest('Must provide query string.'))
+
+            source = Source(query, name='GraphQL request')
+
+            try:
+                document_ast = parse(source)
+                validation_errors = validate(self.schema, document_ast)
+                if validation_errors:
+                    # TODO: Do not return here. We should handle this per subquery.
+                    return ExecutionResult(
+                        errors=validation_errors,
+                        invalid=True,
+                    )
+            except Exception as e:
+                return ExecutionResult(errors=[e], invalid=True)
+
+            if request.method.lower() == 'get':
+                operation_ast = get_operation_ast(document_ast, operation_name)
+                if operation_ast and operation_ast.operation != 'query':
+                    raise HttpError(HttpResponseNotAllowed(
+                        ['POST'], 'Can only perform a {} operation from a POST request.'.format(operation_ast.operation)
+                    ))
+
+            try:
+                result = self.execute(
+                    document_ast,
+                    root_value=self.get_root_value(request),
+                    variable_values=variables,
+                    operation_name=operation_name,
+                    context_value=self.get_context(request)
+                )
+                # TODO: This is really optimistic.
+                # We may have status, we may have errors, etc...
+                # payload should be set according to graphql spec, not
+                # simply "IT WORKED™ Spec".
+                results.append({
+                    "id": _id,
+                    "payload": {
+                        "data": result.data,
+                    }
+                })
+            except Exception as e:
+                return ExecutionResult(errors=[e], invalid=True)
+
+        return results
+
+    def dispatch(self, request, *args, **kwargs):
+        try:
+            if request.method.lower() not in ('get', 'post'):
+                raise HttpError(HttpResponseNotAllowed(['GET', 'POST'], 'GraphQL only supports GET and POST requests.'))
+
+            execution_results = self.execute_graphql_request(request)
+            response = {}
+
+            # TODO: Figure out how batch errors should be handled.
+            # For now, we will simply assume everything works! (HAHA. HA. HAHA. HA.)
+
+            # if execution_result.errors:
+            #     response['errors'] = [self.format_error(e) for e in execution_result.errors]
+
+            # if execution_result.invalid:
+            #     status_code = 400
+            # else:
+
+            status_code = 200
+            response = execution_results
+
+            return HttpResponse(
+                status=status_code,
+                content=self.json_encode(request, response),
+                content_type='application/json'
+            )
+
+        except HttpError as e:
+            response = e.response
+            response['Content-Type'] = 'application/json'
+            response.content = self.json_encode(request, {
+                'errors': [self.format_error(e)]
+            })
+            return response
